@@ -1,3 +1,4 @@
 .crowbar
-error.log
+*.log
 request_example_results
+__pycache__
