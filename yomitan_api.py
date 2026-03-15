@@ -6,14 +6,20 @@ import json
 import os
 import signal
 import struct
+import subprocess
 import sys
 import time
 import traceback
 import urllib
+import urllib.request
 
-ADDR = "127.0.0.1"
+ADDR = "0.0.0.0"
 PORT = 19633
 PROCESS_STARTUP_WAIT = 5
+
+# AnkiConnect configuration - update these if running on a different machine
+ANKICONNECT_HOST = "100.115.222.119"  # Windows Tailscale IP where Anki is running
+ANKICONNECT_PORT = 8765
 
 YOMITAN_API_NATIVE_MESSAGING_VERSION = 1
 YOMITAN_VERSION = "25.12.16.0"  # Minimum version required by asbplayer
@@ -42,7 +48,6 @@ def ensure_single_instance() -> None:
                     os.kill(pid, signal.SIGTERM)
                 else:
                     # Windows: use taskkill or direct termination
-                    import subprocess
                     subprocess.run(["taskkill", "/PID", str(pid), "/F"], 
                                  capture_output=True, timeout=2)
             except (OSError, ValueError, FileNotFoundError, subprocess.TimeoutExpired):
@@ -96,6 +101,41 @@ def send_response(request_handler, status_code: int, content_type: str, data: st
     request_handler.end_headers()
     request_handler.wfile.write(bytes(data, "utf-8"))
 
+def proxy_to_ankiconnect(endpoint: str, body: str) -> dict:
+    """Proxy a request to AnkiConnect and return the response"""
+    try:
+        url = f"http://{ANKICONNECT_HOST}:{ANKICONNECT_PORT}"
+        
+        # Parse the incoming request body
+        try:
+            body_data = json.loads(body) if body else {}
+        except json.JSONDecodeError:
+            body_data = {}
+        
+        # Handle ankiFields endpoint - this needs to call AnkiConnect's ankiFieldsOnTemplate
+        if endpoint == "ankiFields":
+            # ankiFields returns empty for now since AnkiConnect doesn't have this exact endpoint
+            # asbplayer mainly needs this to not error out
+            return {"fields": []}
+        
+        # For other endpoints, try to forward to AnkiConnect
+        anki_request = {"action": endpoint, "version": 6, "params": body_data}
+        
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(anki_request).encode('utf-8'),
+            headers={'Content-Type': 'application/json'}
+        )
+        
+        with urllib.request.urlopen(req, timeout=5) as response:
+            return json.loads(response.read().decode('utf-8'))
+    except urllib.error.URLError as e:
+        error_log(f"Error connecting to AnkiConnect ({endpoint})", str(e))
+        return {"error": f"Cannot connect to AnkiConnect at {ANKICONNECT_HOST}:{ANKICONNECT_PORT}"}
+    except Exception as e:
+        error_log(f"Error proxying to AnkiConnect ({endpoint})", traceback.format_exc())
+        return {"error": str(e)}
+
 def handle_invalid_method(request_handler) -> None:
     request_handler.send_error(405, str(request_handler.command) + " method not allowed, only POST is accepted") # Method Not Allowed
     request_handler.send_header("Allow", "POST")
@@ -123,7 +163,9 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         parsed_url = urllib.parse.urlparse(self.path)
         path = parsed_url.path[1:]
-        params = urllib.parse.parse_qs(parsed_url.query)
+        # Parse query string and convert lists to single values
+        query_params = urllib.parse.parse_qs(parsed_url.query)
+        params = {key: value[0] if len(value) == 1 else value for key, value in query_params.items()}
         content_length = int(self.headers["Content-Length"] or 0)
         body = self.rfile.read(content_length).decode("utf-8")
 
@@ -138,6 +180,24 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
         # Handle yomitanVersion specially to return app version
         if path == "yomitanVersion":
             send_response(self, 200, "application/json", json.dumps({"version": YOMITAN_VERSION}))
+            return
+
+        # Handle common endpoints that may be called in HTTP mode (e.g., by asbplayer)
+        if path == "ankiFields":
+            result = proxy_to_ankiconnect("ankiFields", body)
+            send_response(self, 200, "application/json", json.dumps(result, ensure_ascii=False))
+            return
+        
+        if path == "termEntries":
+            send_response(self, 200, "application/json", json.dumps({"entries": []}))
+            return
+        
+        if path == "kanjiEntries":
+            send_response(self, 200, "application/json", json.dumps({"entries": []}))
+            return
+        
+        if path == "tokenize":
+            send_response(self, 200, "application/json", json.dumps({"tokens": []}))
             return
 
         try:
